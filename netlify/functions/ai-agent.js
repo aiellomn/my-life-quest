@@ -170,11 +170,11 @@ exports.handler = async function(event) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.65,
-            maxOutputTokens: 900,
-            responseMimeType: "application/json"
-          }
+       generationConfig: {
+  temperature: 0.2,
+  maxOutputTokens: 1400,
+  responseMimeType: "application/json"
+}
         })
       }
     );
