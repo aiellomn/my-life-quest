@@ -1,0 +1,1516 @@
+const KEY = "myLifeQuest.netlify.v1";
+const $ = id => document.getElementById(id);
+const todayKey = () => {
+  const d = new Date();
+  d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+  return d.toISOString().slice(0, 10);
+};
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+
+const DEFAULT_PAGE_ORDER = ["today", "tasks", "routines", "projects", "goals", "rewards", "progress", "customize"];
+const PAGE_LABELS = {
+  today: "Today",
+  tasks: "Tasks",
+  routines: "Routines",
+  projects: "Projects",
+  goals: "Goals",
+  rewards: "Rewards",
+  progress: "Progress",
+  customize: "Customize"
+};
+const DEFAULT_DASHBOARD_ORDER = ["quest", "todayTheme", "metrics", "top3", "activeProjects", "nextActions", "weeklyProgress", "pomodoro", "moodEnergy", "todayRoutines"];
+const DASHBOARD_LABELS = {
+  quest: "Quest Points / Vision",
+  todayTheme: "Today's Theme",
+  metrics: "Progress Metrics",
+  top3: "Today's Top 3",
+  activeProjects: "Active Projects",
+  nextActions: "Next Actions",
+  weeklyProgress: "Weekly Progress",
+  pomodoro: "Pomodoro Focus",
+  moodEnergy: "Mood & Energy",
+  todayRoutines: "Today's Routines"
+};
+const ORDERABLE_COLLECTIONS = ["tasks", "routines", "projects", "goals", "rewards"];
+const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const DAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const DEFAULT_THEMED_DAYS = {
+  Sunday: { title: "Reset + Papers", focus: "Papers, planning, sentimental items, spiritual reset, and preparing the week." },
+  Monday: { title: "Closets + Clothing", focus: "Closets, laundry flow, outfits, returns, donations, and dry-cleaning." },
+  Tuesday: { title: "Kitchen + Pantry", focus: "Pantry, fridge, meal prep, groceries, counters, and kitchen systems." },
+  Wednesday: { title: "Creative + Kids", focus: "Crafts, toys, media, games, homeschool/school papers, and creative projects." },
+  Thursday: { title: "Bathrooms + Linens", focus: "Bathrooms, towels, sheets, toiletries, restocking, and guest readiness." },
+  Friday: { title: "Light Day + Catch-Up", focus: "Minimum maintenance, catch-up, grace, and finishing loose ends." },
+  Saturday: { title: "Outdoor + Garage", focus: "Garage, outdoor spaces, pool area, plants, tools, and seasonal projects." }
+};
+
+function ensureAppState() {
+  db.settings = db.settings || {};
+  db.settings.dailyGoal = db.settings.dailyGoal || 50;
+  db.settings.vision = db.settings.vision || "I am building a calm, ordered, healthy life one small quest at a time.";
+  db.settings.streak = db.settings.streak || 0;
+  db.settings.lastActive = db.settings.lastActive || "";
+  db.settings.pageOrder = cleanOrder(db.settings.pageOrder, DEFAULT_PAGE_ORDER);
+  db.settings.dashboardOrder = cleanOrder(db.settings.dashboardOrder, DEFAULT_DASHBOARD_ORDER);
+  db.settings.listSort = db.settings.listSort || { tasks: "custom", routines: "custom", projects: "custom", goals: "custom", rewards: "custom" };
+  db.settings.themedDays = db.settings.themedDays || JSON.parse(JSON.stringify(DEFAULT_THEMED_DAYS));
+  DAYS.forEach(day => {
+    db.settings.themedDays[day] = db.settings.themedDays[day] || { ...DEFAULT_THEMED_DAYS[day] };
+    db.settings.themedDays[day].title = db.settings.themedDays[day].title || DEFAULT_THEMED_DAYS[day].title;
+    db.settings.themedDays[day].focus = db.settings.themedDays[day].focus || DEFAULT_THEMED_DAYS[day].focus;
+  });
+  ORDERABLE_COLLECTIONS.forEach(type => ensureCollectionOrder(type));
+}
+
+function cleanOrder(saved, defaults) {
+  const arr = Array.isArray(saved) ? saved.filter(x => defaults.includes(x)) : [];
+  defaults.forEach(x => { if (!arr.includes(x)) arr.push(x); });
+  return arr;
+}
+
+function dateFromKey(key = todayKey()) {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+function dayNameForKey(key = todayKey()) {
+  return DAYS[dateFromKey(key).getDay()];
+}
+function todayTheme(dayKey = todayKey()) {
+  ensureAppState();
+  const day = dayNameForKey(dayKey);
+  return { day, ...(db.settings.themedDays?.[day] || DEFAULT_THEMED_DAYS[day]) };
+}
+function routineOccursOn(r, dayKey = todayKey()) {
+  const d = dateFromKey(dayKey);
+  const day = DAYS[d.getDay()];
+  const rec = r.recurrence || "Daily";
+  if (rec === "Daily") return true;
+  if (rec === "Weekdays") return d.getDay() >= 1 && d.getDay() <= 5;
+  if (rec === "Weekends") return d.getDay() === 0 || d.getDay() === 6;
+  if (rec === "Theme Day") return (r.themeDay || "") === day;
+  if (rec === "Custom Days") return Array.isArray(r.days) && r.days.includes(day);
+  return true;
+}
+function todaysRoutines(dayKey = todayKey()) {
+  return orderedItems("routines", (a,b)=>(a.time||"").localeCompare(b.time||"")).filter(r => routineOccursOn(r, dayKey));
+}
+function routineScheduleLabel(r) {
+  if (r.recurrence === "Theme Day") return `Theme Day: ${r.themeDay || "Unassigned"}`;
+  if (r.recurrence === "Custom Days") return (r.days || []).map(d => DAY_SHORT[DAYS.indexOf(d)] || d).join(", ") || "Custom Days";
+  return r.recurrence || "Daily";
+}
+function logRoutineSteps(day = todayKey(), routineId) {
+  const l = log(day);
+  l.routineSteps = l.routineSteps || {};
+  l.routineSteps[routineId] = l.routineSteps[routineId] || [];
+  return l.routineSteps[routineId];
+}
+function isRoutineStepDone(routineId, stepId, day = todayKey()) {
+  return logRoutineSteps(day, routineId).includes(stepId);
+}
+
+function ensureCollectionOrder(type) {
+  if (!Array.isArray(db[type])) db[type] = [];
+  db[type].forEach((item, idx) => {
+    if (typeof item.order !== "number") item.order = idx;
+  });
+}
+
+function orderedItems(type, fallbackSorter = null) {
+  ensureCollectionOrder(type);
+  const items = [...db[type]];
+  const mode = db.settings?.listSort?.[type] || "custom";
+  if (mode === "custom") return items.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  if (fallbackSorter) return items.sort(fallbackSorter);
+  return items;
+}
+
+function nextOrder(type) {
+  ensureCollectionOrder(type);
+  return db[type].length ? Math.max(...db[type].map(x => x.order ?? 0)) + 1 : 0;
+}
+
+function moveInOrderArray(kind, value, direction) {
+  const key = kind === "page" ? "pageOrder" : "dashboardOrder";
+  const arr = [...db.settings[key]];
+  const idx = arr.indexOf(value);
+  const newIdx = idx + direction;
+  if (idx < 0 || newIdx < 0 || newIdx >= arr.length) return;
+  [arr[idx], arr[newIdx]] = [arr[newIdx], arr[idx]];
+  db.settings[key] = arr;
+  save();
+}
+
+function resetOrder(kind) {
+  if (kind === "page") db.settings.pageOrder = [...DEFAULT_PAGE_ORDER];
+  if (kind === "dashboard") db.settings.dashboardOrder = [...DEFAULT_DASHBOARD_ORDER];
+  save();
+}
+
+function moveItem(type, id, direction) {
+  ensureCollectionOrder(type);
+  const items = orderedItems(type);
+  const idx = items.findIndex(x => x.id === id);
+  const newIdx = idx + direction;
+  if (idx < 0 || newIdx < 0 || newIdx >= items.length) return;
+  [items[idx].order, items[newIdx].order] = [items[newIdx].order, items[idx].order];
+  save();
+}
+
+function orderButtons(type, id) {
+  return `<span class="orderControls"><button class="small secondary" title="Move up" onclick="moveItem('${type}','${id}',-1)">↑</button><button class="small secondary" title="Move down" onclick="moveItem('${type}','${id}',1)">↓</button></span>`;
+}
+
+function setListSort(type, mode) {
+  db.settings.listSort = db.settings.listSort || {};
+  db.settings.listSort[type] = mode;
+  save();
+}
+
+function switchTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+  if ($(activeTab)) $(activeTab).classList.add("active");
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.tab === activeTab));
+  render();
+}
+
+function renderNav() {
+  ensureAppState();
+  const nav = document.querySelector("nav");
+  if (!nav) return;
+  nav.innerHTML = db.settings.pageOrder.map(tab => `<button data-tab="${tab}" class="${activeTab === tab ? "active" : ""}">${PAGE_LABELS[tab] || tab}</button>`).join("");
+  nav.querySelectorAll("button").forEach(btn => btn.addEventListener("click", () => switchTab(btn.dataset.tab)));
+}
+
+
+// Collapsible UI state. This is a local display preference.
+const COLLAPSE_KEY = "myLifeQuest.collapseState.v1";
+let collapsedState = JSON.parse(localStorage.getItem(COLLAPSE_KEY) || "{}");
+
+function collapseKey(type, id) {
+  return `${type}:${id}`;
+}
+function isCollapsed(type, id) {
+  return collapsedState[collapseKey(type, id)] !== false; // collapsed by default
+}
+function toggleCollapse(type, id) {
+  collapsedState[collapseKey(type, id)] = !isCollapsed(type, id);
+  localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsedState));
+  render();
+}
+function collapseAll(type) {
+  const collections = { task: db.tasks || [], routine: db.routines || [], project: db.projects || [], goal: db.goals || [] };
+  (collections[type] || []).forEach(item => collapsedState[collapseKey(type, item.id)] = true);
+  localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsedState));
+  render();
+}
+function expandAll(type) {
+  const collections = { task: db.tasks || [], routine: db.routines || [], project: db.projects || [], goal: db.goals || [] };
+  (collections[type] || []).forEach(item => collapsedState[collapseKey(type, item.id)] = false);
+  localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsedState));
+  render();
+}
+function caret(type, id) {
+  return isCollapsed(type, id) ? "▶" : "▼";
+}
+
+
+// Firebase cloud sync config
+const firebaseConfig = {
+  apiKey: "AIzaSyCmdi5wzkTMS6uxRrnqnIIifh3qzVUI_oQ",
+  authDomain: "my-life-quest-1472b.firebaseapp.com",
+  projectId: "my-life-quest-1472b",
+  storageBucket: "my-life-quest-1472b.firebasestorage.app",
+  messagingSenderId: "113429228531",
+  appId: "1:113429228531:web:29c5866f683427fa2d0086"
+};
+
+let firebaseReady = false;
+let currentUser = null;
+let cloudUnsubscribe = null;
+let isApplyingCloudData = false;
+let cloudSaveTimer = null;
+let auth = null;
+let provider = null;
+let firestore = null;
+let docRef = null;
+
+async function initFirebaseCloudSync() {
+  if (!window.firebaseModules) {
+    window.addEventListener("firebase-modules-ready", initFirebaseCloudSync, { once: true });
+    console.warn("Firebase modules not loaded yet.");
+    return;
+  }
+
+  const {
+    initializeApp,
+    getAuth,
+    GoogleAuthProvider,
+    signInWithPopup,
+    signOut,
+    onAuthStateChanged,
+    getFirestore,
+    doc,
+    setDoc,
+    getDoc,
+    onSnapshot,
+    serverTimestamp
+  } = window.firebaseModules;
+
+  const firebaseApp = initializeApp(firebaseConfig);
+  auth = getAuth(firebaseApp);
+  provider = new GoogleAuthProvider();
+  firestore = getFirestore(firebaseApp);
+  firebaseReady = true;
+
+  window.signInToQuest = async function () {
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (error) {
+      modal("Login Error", `<p>${escapeHtml(error.message)}</p><button onclick="closeModal()">Close</button>`);
+    }
+  };
+
+  window.signOutOfQuest = async function () {
+    try {
+      await signOut(auth);
+    } catch (error) {
+      modal("Sign Out Error", `<p>${escapeHtml(error.message)}</p><button onclick="closeModal()">Close</button>`);
+    }
+  };
+
+  onAuthStateChanged(auth, async (user) => {
+    currentUser = user;
+
+    if (cloudUnsubscribe) {
+      cloudUnsubscribe();
+      cloudUnsubscribe = null;
+    }
+
+    if (!user) {
+      render();
+      return;
+    }
+
+    docRef = doc(firestore, "users", user.uid, "appData", "main");
+    const snap = await getDoc(docRef);
+
+    if (snap.exists()) {
+      const cloud = snap.data();
+      if (cloud && cloud.db) {
+        isApplyingCloudData = true;
+        db = cloud.db;
+        localStorage.setItem(KEY, JSON.stringify(db));
+        isApplyingCloudData = false;
+      }
+    } else {
+      await setDoc(docRef, {
+        db,
+        updatedAt: serverTimestamp(),
+        createdAt: serverTimestamp()
+      }, { merge: true });
+    }
+
+    cloudUnsubscribe = onSnapshot(docRef, (snapshot) => {
+      if (!snapshot.exists()) return;
+      const data = snapshot.data();
+      if (!data || !data.db) return;
+
+      isApplyingCloudData = true;
+      db = data.db;
+      localStorage.setItem(KEY, JSON.stringify(db));
+      isApplyingCloudData = false;
+      render();
+    });
+
+    render();
+  });
+}
+
+async function saveToCloudNow() {
+  if (!currentUser || !docRef || isApplyingCloudData || !window.firebaseModules) return;
+  const { setDoc, serverTimestamp } = window.firebaseModules;
+  await setDoc(docRef, {
+    db,
+    updatedAt: serverTimestamp()
+  }, { merge: true });
+}
+
+function queueCloudSave() {
+  if (!currentUser || isApplyingCloudData) return;
+  clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = setTimeout(() => {
+    saveToCloudNow().catch(err => console.error("Cloud save failed:", err));
+  }, 600);
+}
+
+function userStatusHtml() {
+  if (!firebaseReady) {
+    return `<span class="muted">Cloud sync loading...</span>`;
+  }
+  if (!currentUser) {
+    return `<button class="secondary small" onclick="signInToQuest()">Sign in with Google</button><span class="muted"> Local-only until signed in.</span>`;
+  }
+  const name = currentUser.displayName || currentUser.email || "Signed in";
+  return `<span class="pill">☁️ Cloud sync on</span><span class="muted">${escapeHtml(name)}</span> <button class="secondary small" onclick="signOutOfQuest()">Sign out</button>`;
+}
+
+
+let activeTab = "today";
+let pomodoro = { seconds: 25 * 60, running: false, timer: null };
+
+
+let activePomodoroTasks = [];
+let lastPomodoroStartedAt = null;
+
+function getPomodoroCandidates() {
+  return db.tasks
+    .filter(t => (t.percent || 0) < 100)
+    .map(t => {
+      const uncheckedSubtasks = (t.subtasks || []).filter(s => !s.done);
+      const hasDue = Boolean(t.due);
+      const score = (hasDue ? 25 : 0) + pointsFor(t.difficulty) + (uncheckedSubtasks.length ? 8 : 0);
+      return { ...t, score, uncheckedSubtasks };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 6);
+}
+
+function pomodoroTaskPicker() {
+  const candidates = getPomodoroCandidates();
+  if (!candidates.length) {
+    modal("Pomodoro Focus", `<p>No open tasks yet. Add a task first, then start a focus session.</p><button onclick="closeModal()">Close</button>`);
+    return;
+  }
+
+  modal("Choose a 25-minute focus block", `
+    <p class="muted">Pick 1–3 tasks or small subtasks to work on. The timer will check in when it ends.</p>
+    ${candidates.map(t => `
+      <label class="checkline">
+        <input type="checkbox" class="pomodoroPick" value="${t.id}">
+        <span><b>${escapeHtml(t.title)}</b><br><span class="muted">${t.difficulty || "Easy"} · ${pointsFor(t.difficulty)} pts · ${t.percent || 0}%${t.uncheckedSubtasks.length ? " · " + t.uncheckedSubtasks.length + " subtasks left" : ""}</span></span>
+      </label>
+    `).join("")}
+    <br>
+    <button onclick="startPomodoroWithSelected()">Start 25 Minutes</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+}
+
+function startPomodoroWithSelected() {
+  const picked = Array.from(document.querySelectorAll(".pomodoroPick:checked")).map(x => x.value);
+  activePomodoroTasks = picked.length ? picked : getPomodoroCandidates().slice(0, 1).map(t => t.id);
+  lastPomodoroStartedAt = new Date().toISOString();
+  closeModal();
+  beginPomodoroTimer();
+}
+
+function pomodoroCompletionCheckIn() {
+  const selected = activePomodoroTasks.map(id => db.tasks.find(t => t.id === id)).filter(Boolean);
+  modal("⏱ Pomodoro complete — what got done?", `
+    <p class="muted">Check anything you completed. You’ll get partial credit for subtasks.</p>
+    ${selected.map(t => `
+      <div class="item">
+        <div class="title">${escapeHtml(t.title)}</div>
+        <label class="checkline"><input type="checkbox" class="pomodoroDoneTask" value="${t.id}"> Mark full task complete</label>
+        ${(t.subtasks || []).length ? `<div style="margin-top:8px">${(t.subtasks || []).map((s, idx) => `
+          <label class="checkline">
+            <input type="checkbox" class="pomodoroDoneSubtask" data-task="${t.id}" data-index="${idx}" ${s.done ? "checked" : ""}>
+            <span>${escapeHtml(s.title || s)}</span>
+          </label>
+        `).join("")}</div>` : `<div class="muted">No subtasks yet.</div>`}
+      </div>
+    `).join("") || `<p>No task was selected for this session.</p>`}
+    <br>
+    <button onclick="savePomodoroCheckIn()">Save Progress</button>
+    <button class="secondary" onclick="closeModal()">Skip</button>
+  `);
+}
+
+function savePomodoroCheckIn() {
+  const beforePoints = log().points || 0;
+
+  Array.from(document.querySelectorAll(".pomodoroDoneSubtask")).forEach(box => {
+    if (!box.checked) return;
+    const task = db.tasks.find(t => t.id === box.dataset.task);
+    const idx = Number(box.dataset.index);
+    if (task && task.subtasks && task.subtasks[idx]) {
+      task.subtasks[idx].done = true;
+      updateTaskProgressFromSubtasks(task.id, true);
+    }
+  });
+
+  Array.from(document.querySelectorAll(".pomodoroDoneTask:checked")).forEach(box => {
+    const task = db.tasks.find(t => t.id === box.value);
+    if (task) {
+      (task.subtasks || []).forEach(s => s.done = true);
+      completeTask(task.id, 100);
+    }
+  });
+
+  if ((log().points || 0) === beforePoints) {
+    log().points += 5; // effort credit even if nothing was marked complete
+  }
+
+  activePomodoroTasks = [];
+  closeModal();
+  save();
+  toast("Pomodoro progress saved.");
+}
+
+function beginPomodoroTimer() {
+  if (pomodoro.running) return;
+  pomodoro.running = true;
+  pomodoro.timer = setInterval(() => {
+    pomodoro.seconds -= 1;
+    if (pomodoro.seconds <= 0) {
+      clearInterval(pomodoro.timer);
+      pomodoro.running = false;
+      pomodoro.seconds = 25 * 60;
+      log().points += 5;
+      save();
+      pomodoroCompletionCheckIn();
+      return;
+    }
+    renderToday();
+  }, 1000);
+}
+
+
+let db = JSON.parse(localStorage.getItem(KEY) || "null") || {
+  settings: {
+    dailyGoal: 50,
+    vision: "I am building a calm, ordered, healthy life one small quest at a time.",
+    streak: 0,
+    lastActive: ""
+  },
+  tasks: [],
+  routines: [],
+  projects: [],
+  goals: [],
+  rewards: [
+    { id: uid(), title: "Coffee treat", threshold: 100 },
+    { id: uid(), title: "New book", threshold: 300 },
+    { id: uid(), title: "Relaxing day trip", threshold: 800 }
+  ],
+  logs: {}
+};
+ensureAppState();
+
+function save() {
+  ensureAppState();
+  localStorage.setItem(KEY, JSON.stringify(db));
+  queueCloudSave();
+  render();
+}
+function log(day = todayKey()) {
+  if (!db.logs[day]) db.logs[day] = { points: 0, completedTasks: [], completedRoutines: [], mood: 3, energy: 3, reflections: [] };
+  return db.logs[day];
+}
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[m]));
+}
+function pointsFor(diff) { return diff === "Hard" ? 20 : diff === "Medium" ? 10 : 5; }
+function percent(items, doneFn) { return items.length ? Math.round(items.filter(doneFn).length / items.length * 100) : 0; }
+function totalPoints() { return Object.values(db.logs).reduce((s, day) => s + (day.points || 0), 0); }
+function projectProgress(p) {
+  const linked = db.tasks.filter(t => t.projectId === p.id);
+  return linked.length ? Math.round(linked.reduce((s, t) => s + (t.percent || 0), 0) / linked.length) : 0;
+}
+function goalProgress(g) {
+  const linked = db.tasks.filter(t => t.goalId === g.id);
+  return linked.length ? Math.round(linked.reduce((s, t) => s + (t.percent || 0), 0) / linked.length) : 0;
+}
+function toast(msg) {
+  $("toast").textContent = msg;
+  $("toast").style.display = "block";
+  setTimeout(() => $("toast").style.display = "none", 2600);
+}
+function modal(title, html) {
+  const m = $("modal");
+  m.innerHTML = `<div class="modalHead">${title}</div><div class="modalBody">${html}</div>`;
+  m.showModal();
+}
+function closeModal() { $("modal").close(); }
+
+async function callAgent(agent, payload) {
+  const today = log();
+  today.aiUses = today.aiUses || 0;
+  if (today.aiUses >= 12) {
+    throw new Error("Daily AI limit reached. This protects your credits. You can raise the limit in app.js later.");
+  }
+  const response = await fetch("/.netlify/functions/ai-agent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agent, ...payload, globalVision: db.settings.vision })
+  });
+  const data = await response.json();
+  if (!data.ok) throw new Error(data.error || "AI failed");
+  today.aiUses += 1;
+  localStorage.setItem(KEY, JSON.stringify(db));
+  return data.result;
+}
+async function withAI(buttonId, fn) {
+  const btn = buttonId ? $(buttonId) : null;
+  const old = btn ? btn.textContent : "";
+  try {
+    if (btn) { btn.disabled = true; btn.textContent = "Thinking..."; }
+    await fn();
+  } catch (err) {
+    modal("AI Agent Error", `<p>${escapeHtml(err.message)}</p><p class="muted">Make sure your Netlify Environment Variable is named GEMINI_API_KEY, then redeploy.</p><button onclick="closeModal()">Close</button>`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = old; }
+  }
+}
+
+function voiceTo(id) {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) return toast("Voice input is not available in this browser.");
+  const rec = new SpeechRecognition();
+  rec.lang = "en-US";
+  rec.onresult = e => {
+    const txt = e.results[0][0].transcript;
+    $(id).value = ($(id).value ? $(id).value + " " : "") + txt;
+  };
+  rec.start();
+}
+
+renderNav();
+$("fab").onclick = () => quickAdd();
+$("visionBtn").onclick = () => editVision();
+
+function quickAdd() {
+  if (activeTab === "routines") formRoutine();
+  else if (activeTab === "projects") formProject();
+  else if (activeTab === "goals") formGoal();
+  else if (activeTab === "rewards") formReward();
+  else formTask();
+}
+
+function editVision() {
+  modal("Vision & Daily Goal", `
+    <label>Global long-term vision</label>
+    <textarea id="vText">${escapeHtml(db.settings.vision)}</textarea>
+    <button class="small secondary" onclick="voiceTo('vText')">🎙 Voice</button>
+    <label>Daily points goal</label>
+    <input id="vGoal" type="number" value="${db.settings.dailyGoal}">
+    <br><br>
+    <button onclick="db.settings.vision=$('vText').value; db.settings.dailyGoal=Number($('vGoal').value||50); closeModal(); save();">Save</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+}
+
+function formTask(t = {}) {
+  modal(t.id ? "Edit Task" : "Add Task", `
+    <label>Title</label><input id="fTitle" value="${escapeHtml(t.title || "")}">
+    <button class="small secondary" onclick="voiceTo('fTitle')">🎙 Voice</button>
+    <label>Notes</label><textarea id="fNotes">${escapeHtml(t.notes || "")}</textarea>
+    <div class="grid">
+      <div><label>Due date/time</label><input id="fDue" type="datetime-local" value="${t.due || ""}"></div>
+      <div><label>Difficulty</label><select id="fDiff">${["Easy", "Medium", "Hard"].map(x => `<option ${t.difficulty === x ? "selected" : ""}>${x}</option>`).join("")}</select></div>
+    </div>
+    <label>Subtasks, one per line</label><textarea id="fSubs">${(t.subtasks || []).map(s => escapeHtml(s.title || s)).join("\n")}</textarea>
+    <div class="row"><button id="taskBreakBtn" class="secondary" onclick="aiBreakTask()">AI Break Into Steps</button></div>
+    <div class="grid">
+      <div><label>Project</label><select id="fProject"><option value="">None</option>${db.projects.map(p => `<option value="${p.id}" ${t.projectId === p.id ? "selected" : ""}>${escapeHtml(p.title)}</option>`).join("")}</select></div>
+      <div><label>Goal</label><select id="fGoal"><option value="">None</option>${db.goals.map(g => `<option value="${g.id}" ${t.goalId === g.id ? "selected" : ""}>${escapeHtml(g.title)}</option>`).join("")}</select></div>
+    </div>
+    <br><button onclick="saveTask('${t.id || ""}')">Save</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+}
+async function aiBreakTask() {
+  await withAI("taskBreakBtn", async () => {
+    const result = await callAgent("taskBreaker", { text: $("fTitle").value + "\n" + $("fNotes").value });
+    $("fTitle").value = result.title || $("fTitle").value;
+    $("fDiff").value = result.difficulty || $("fDiff").value;
+    $("fSubs").value = (result.subtasks || []).join("\n");
+    toast("Task broken into small steps.");
+  });
+}
+
+function stableSubtaskObjects(oldSubs, newTitles) {
+  oldSubs = oldSubs || [];
+  const used = new Set();
+  return newTitles.map((title, index) => {
+    const cleanTitle = String(title || "").trim();
+    let matchIndex = oldSubs.findIndex((s, i) => !used.has(i) && (s.title || s) === cleanTitle);
+    if (matchIndex < 0 && oldSubs[index] && !used.has(index)) {
+      // If the user only renamed a line in place, preserve that step's id and checked state.
+      matchIndex = index;
+    }
+    if (matchIndex >= 0) {
+      used.add(matchIndex);
+      const existing = oldSubs[matchIndex];
+      return {
+        id: existing.id || uid(),
+        title: cleanTitle,
+        done: Boolean(existing.done)
+      };
+    }
+    return { id: uid(), title: cleanTitle, done: false };
+  });
+}
+
+function preserveRoutineStepLogs(routineId, oldSubs, newSubs) {
+  // Routine checkmarks are stored in daily logs by step id. Because stableSubtaskObjects
+  // keeps ids when a line is renamed or edited in place, most daily progress remains intact.
+  // This cleanup removes log entries for deleted steps so old deleted steps do not count forever.
+  const validIds = new Set((newSubs || []).map(s => s.id || s.title));
+  Object.keys(db.logs || {}).forEach(day => {
+    const stepsByRoutine = db.logs[day].routineSteps;
+    if (!stepsByRoutine || !stepsByRoutine[routineId]) return;
+    stepsByRoutine[routineId] = stepsByRoutine[routineId].filter(stepId => validIds.has(stepId));
+  });
+}
+
+function editSubtasksQuick(type, id) {
+  const collection = type === "routine" ? db.routines : db.tasks;
+  const item = collection.find(x => x.id === id);
+  if (!item) return;
+  modal(type === "routine" ? "Edit Routine Steps" : "Edit Task Subtasks", `
+    <p class="muted">Edit one line per step. Existing checkmarks are preserved when possible, especially when you rename or reorder lightly instead of deleting everything.</p>
+    <label>${type === "routine" ? "Routine steps" : "Task subtasks"}</label>
+    <textarea id="quickSubs">${(item.subtasks || []).map(s => escapeHtml(s.title || s)).join("\n")}</textarea>
+    <br><button onclick="saveSubtasksQuick('${type}','${id}')">Save Steps</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+}
+
+function saveSubtasksQuick(type, id) {
+  const collection = type === "routine" ? db.routines : db.tasks;
+  const item = collection.find(x => x.id === id);
+  if (!item) return;
+  const oldSubs = item.subtasks || [];
+  const newTitles = $("quickSubs").value.split("\n").map(x => x.trim()).filter(Boolean);
+  const newSubs = stableSubtaskObjects(oldSubs, newTitles);
+  item.subtasks = newSubs;
+  if (type === "routine") preserveRoutineStepLogs(id, oldSubs, newSubs);
+  closeModal(); save();
+  toast(type === "routine" ? "Routine steps updated." : "Task subtasks updated.");
+}
+
+function saveTask(id) {
+  const obj = id ? db.tasks.find(t => t.id === id) : { id: uid(), percent: 0, order: nextOrder("tasks") };
+  const oldSubs = obj.subtasks || [];
+  const newTitles = $("fSubs").value.split("\n").map(x => x.trim()).filter(Boolean);
+  Object.assign(obj, {
+    title: $("fTitle").value.trim() || "Untitled task",
+    notes: $("fNotes").value.trim(),
+    due: $("fDue").value,
+    difficulty: $("fDiff").value,
+    subtasks: stableSubtaskObjects(oldSubs, newTitles),
+    projectId: $("fProject").value || "",
+    goalId: $("fGoal").value || ""
+  });
+  updateTaskProgressFromSubtasks(obj);
+  if (!id) db.tasks.push(obj);
+  closeModal(); save();
+}
+
+function formRoutine(r = {}) {
+  const rec = r.recurrence || "Daily";
+  const dayChecks = DAYS.map(day => `<label class="checkline"><input type="checkbox" class="rDay" value="${day}" ${(r.days || []).includes(day) ? "checked" : ""}> <span>${day}</span></label>`).join("");
+  modal(r.id ? "Edit Routine" : "Add Routine", `
+    <label>Title</label><input id="rTitle" value="${escapeHtml(r.title || "")}">
+    <button class="small secondary" onclick="voiceTo('rTitle')">🎙 Voice</button>
+    <label>Time</label><input id="rTime" type="time" value="${r.time || "07:00"}">
+    <label>Recurrence</label><select id="rRec" onchange="updateRoutineRecurrenceFields()">${["Daily", "Weekdays", "Weekends", "Theme Day", "Custom Days"].map(x => `<option ${rec === x ? "selected" : ""}>${x}</option>`).join("")}</select>
+    <div id="rThemeWrap">
+      <label>Themed day</label><select id="rThemeDay">${DAYS.map(day => `<option value="${day}" ${(r.themeDay || dayNameForKey()) === day ? "selected" : ""}>${day}: ${escapeHtml((db.settings.themedDays?.[day] || DEFAULT_THEMED_DAYS[day]).title)}</option>`).join("")}</select>
+      <p class="muted">Use this for Grace & Order themed days so repeating routines appear on the right focus day.</p>
+    </div>
+    <div id="rDaysWrap">
+      <label>Custom days</label><div class="grid">${dayChecks}</div>
+    </div>
+    <label>Subtasks, one per line</label><textarea id="rSubs">${(r.subtasks || []).map(s => escapeHtml(s.title || s)).join("\n")}</textarea>
+    <label>Apply routine template changes</label><select id="rApply"><option value="future">Starting today / future repeats</option><option value="template">Template only</option></select>
+    <p class="muted">Existing daily checkmarks are preserved when possible. Deleted steps are removed from old daily logs so progress stays accurate.</p>
+    <br><button onclick="saveRoutine('${r.id || ""}')">Save</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+  updateRoutineRecurrenceFields();
+}
+function updateRoutineRecurrenceFields() {
+  const rec = $("rRec")?.value || "Daily";
+  if ($("rThemeWrap")) $("rThemeWrap").style.display = rec === "Theme Day" ? "block" : "none";
+  if ($("rDaysWrap")) $("rDaysWrap").style.display = rec === "Custom Days" ? "block" : "none";
+}
+function saveRoutine(id) {
+  const obj = id ? db.routines.find(r => r.id === id) : { id: uid(), order: nextOrder("routines") };
+  const oldSubs = obj.subtasks || [];
+  const newTitles = $("rSubs").value.split("\n").map(x => x.trim()).filter(Boolean);
+  const newSubs = stableSubtaskObjects(oldSubs, newTitles);
+  Object.assign(obj, {
+    title: $("rTitle").value.trim() || "Untitled routine",
+    time: $("rTime").value,
+    recurrence: $("rRec").value,
+    themeDay: $("rThemeDay")?.value || "",
+    days: Array.from(document.querySelectorAll(".rDay:checked")).map(x => x.value),
+    subtasks: newSubs,
+    applyChanges: $("rApply")?.value || "future"
+  });
+  preserveRoutineStepLogs(obj.id, oldSubs, newSubs);
+  if (!id) db.routines.push(obj);
+  closeModal(); save();
+}
+function toggleRoutineStep(routineId, stepId) {
+  const steps = logRoutineSteps(todayKey(), routineId);
+  const idx = steps.indexOf(stepId);
+  if (idx >= 0) steps.splice(idx, 1);
+  else steps.push(stepId);
+  const r = db.routines.find(x => x.id === routineId);
+  if (r && (r.subtasks || []).length && steps.length >= r.subtasks.length && !log().completedRoutines.includes(routineId)) {
+    log().completedRoutines.push(routineId);
+    log().points += 5;
+  }
+  save();
+}
+
+function formProject(p = {}) {
+  modal(p.id ? "Edit Project" : "Add Project", `
+    <label>Project title</label><input id="pTitle" value="${escapeHtml(p.title || "")}">
+    <label>Project vision</label><textarea id="pVision">${escapeHtml(p.vision || "")}</textarea>
+    <label>Describe project for AI Project Breaker</label><textarea id="pBreak" placeholder="Example: declutter my bedroom closet and create a simple laundry system"></textarea>
+    <button class="small secondary" onclick="voiceTo('pBreak')">🎙 Voice</button>
+    <br><br>
+    <button onclick="saveProject('${p.id || ""}', false)">Save</button>
+    <button id="projectAIBtn" class="secondary" onclick="saveProject('${p.id || ""}', true)">Save + AI Break Project</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+}
+async function saveProject(id, useAI) {
+  const isNew = !id;
+  const obj = id ? db.projects.find(p => p.id === id) : { id: uid(), order: nextOrder("projects") };
+  obj.title = $("pTitle").value.trim() || "Untitled project";
+  obj.vision = $("pVision").value.trim();
+  if (isNew) db.projects.push(obj);
+
+  const description = $("pBreak").value.trim();
+  if (useAI && description) {
+    await withAI("projectAIBtn", async () => {
+      const result = await callAgent("projectBreaker", { text: description });
+      obj.title = result.title || obj.title;
+      obj.vision = result.vision || obj.vision;
+      (result.tasks || []).forEach(task => db.tasks.push({
+        id: uid(),
+        title: task.title || "Project task",
+        notes: task.notes || "",
+        due: "",
+        difficulty: ["Easy", "Medium", "Hard"].includes(task.difficulty) ? task.difficulty : "Medium",
+        percent: 0,
+        subtasks: (task.subtasks || []).map(title => ({ id: uid(), title, done: false })),
+        order: nextOrder("tasks"),
+        projectId: obj.id,
+        goalId: ""
+      }));
+      closeModal(); save(); toast("Project created with AI tasks.");
+    });
+    return;
+  }
+  closeModal(); save();
+}
+
+function formGoal(g = {}) {
+  modal(g.id ? "Edit Goal" : "Add Goal", `
+    <label>Goal title</label><input id="gTitle" value="${escapeHtml(g.title || "")}">
+    <label>Goal vision</label><textarea id="gVision">${escapeHtml(g.vision || "")}</textarea>
+    <label>Describe goal for AI Goal Breaker</label><textarea id="gBreak" placeholder="Example: get stronger and more consistent with workouts"></textarea>
+    <button class="small secondary" onclick="voiceTo('gBreak')">🎙 Voice</button>
+    <br><br>
+    <button onclick="saveGoal('${g.id || ""}', false)">Save</button>
+    <button id="goalAIBtn" class="secondary" onclick="saveGoal('${g.id || ""}', true)">Save + AI Break Goal</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+}
+async function saveGoal(id, useAI) {
+  const isNew = !id;
+  const obj = id ? db.goals.find(g => g.id === id) : { id: uid(), order: nextOrder("goals") };
+  obj.title = $("gTitle").value.trim() || "Untitled goal";
+  obj.vision = $("gVision").value.trim();
+  if (isNew) db.goals.push(obj);
+
+  const description = $("gBreak").value.trim();
+  if (useAI && description) {
+    await withAI("goalAIBtn", async () => {
+      const result = await callAgent("goalBreaker", { text: description });
+      obj.title = result.title || obj.title;
+      obj.vision = result.vision || obj.vision;
+      (result.tasks || []).forEach(task => db.tasks.push({
+        id: uid(),
+        title: task.title || "Goal task",
+        notes: task.notes || "",
+        due: "",
+        difficulty: ["Easy", "Medium", "Hard"].includes(task.difficulty) ? task.difficulty : "Medium",
+        percent: 0,
+        subtasks: (task.subtasks || []).map(title => ({ id: uid(), title, done: false })),
+        order: nextOrder("tasks"),
+        projectId: "",
+        goalId: obj.id
+      }));
+      closeModal(); save(); toast("Goal created with AI tasks.");
+    });
+    return;
+  }
+  closeModal(); save();
+}
+
+function formReward(r = {}) {
+  modal(r.id ? "Edit Reward" : "Add Reward", `
+    <label>Reward</label><input id="rwTitle" value="${escapeHtml(r.title || "")}">
+    <label>Point threshold</label><input id="rwThreshold" type="number" value="${r.threshold || 100}">
+    <br><br><button onclick="saveReward('${r.id || ""}')">Save</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+}
+function saveReward(id) {
+  const obj = id ? db.rewards.find(r => r.id === id) : { id: uid(), order: nextOrder("rewards") };
+  obj.title = $("rwTitle").value.trim() || "Untitled reward";
+  obj.threshold = Number($("rwThreshold").value || 100);
+  if (!id) db.rewards.push(obj);
+  closeModal(); save();
+}
+
+async function completeTask(id, amount = 100) {
+  const t = db.tasks.find(x => x.id === id);
+  if (!t) return;
+  const before = t.percent || 0;
+  t.percent = Math.max(t.percent || 0, amount);
+  if (amount >= 100) {
+    normalizeSubtasks(t);
+    (t.subtasks || []).forEach(s => s.done = true);
+  }
+  if (before < 100 && t.percent >= 100 && !log().completedTasks.includes(id)) {
+    log().completedTasks.push(id);
+    log().points += pointsFor(t.difficulty);
+  } else if (amount < 100 && before < amount) {
+    log().points += Math.ceil(pointsFor(t.difficulty) * 0.5);
+  }
+  db.settings.lastActive = todayKey();
+  save();
+
+  const itemVision = t.projectId ? (db.projects.find(p => p.id === t.projectId)?.vision || db.settings.vision)
+    : t.goalId ? (db.goals.find(g => g.id === t.goalId)?.vision || db.settings.vision)
+    : db.settings.vision;
+
+  try {
+    const result = await callAgent("affirmation", { text: t.title, itemVision });
+    modal(result.title || "✨ Quest progress!", `
+      <p>${escapeHtml(result.message || "You made progress. That counts.")}</p>
+      <p class="muted">${escapeHtml(result.visionMessage || itemVision)}</p>
+      <button onclick="closeModal()">Keep going 🌿</button>
+    `);
+  } catch {
+    modal("✨ Quest progress!", `
+      <p>You made progress. That counts.</p>
+      <p class="muted">Start with the end in mind: ${escapeHtml(itemVision)}</p>
+      <button onclick="closeModal()">Keep going 🌿</button>
+    `);
+  }
+}
+function completeRoutine(id) {
+  const r = db.routines.find(x => x.id === id);
+  if (r) {
+    const steps = logRoutineSteps(todayKey(), id);
+    (r.subtasks || []).forEach(s => { const sid = s.id || s.title; if (!steps.includes(sid)) steps.push(sid); });
+  }
+  if (!log().completedRoutines.includes(id)) {
+    log().completedRoutines.push(id);
+    log().points += 5;
+  }
+  save();
+  modal("🔥 Routine complete", `<p>Beautiful follow-through. Your future self is being cared for.</p><button onclick="closeModal()">Done</button>`);
+}
+function remove(type, id) {
+  db[type] = db[type].filter(x => x.id !== id);
+  save();
+}
+
+function startPomodoro() {
+  if (pomodoro.running) return;
+  pomodoroTaskPicker();
+}
+function resetPomodoro() {
+  clearInterval(pomodoro.timer);
+  pomodoro = { seconds: 25 * 60, running: false, timer: null };
+  activePomodoroTasks = [];
+  renderToday();
+}
+function pomodoroLabel() {
+  const m = Math.floor(pomodoro.seconds / 60).toString().padStart(2, "0");
+  const s = (pomodoro.seconds % 60).toString().padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+async function planDay() {
+  await withAI("planBtn", async () => {
+    const openItems = [
+      ...todaysRoutines().map(r => ({ type: "routine", title: r.title, time: r.time, recurrence: routineScheduleLabel(r) })),
+      ...db.tasks.filter(t => (t.percent || 0) < 100).slice(0, 12).map(t => ({ type: "task", title: t.title, difficulty: t.difficulty, due: t.due }))
+    ];
+    const result = await callAgent("dailyPlanner", { mood: log().mood, energy: log().energy, items: openItems });
+    modal("🧭 AI Daily Planner", `
+      <p>${escapeHtml(result.summary || "")}</p>
+      <h3>Minimum Viable Day</h3>
+      ${(result.minimumViableDay || []).map(x => `<div class="item">${escapeHtml(x)}</div>`).join("")}
+      <h3>Priority Plan</h3>
+      ${(result.priorityPlan || []).map(x => `<div class="item"><b>${escapeHtml(x.title)}</b><br><span class="muted">${escapeHtml(x.timeBlock || "")} — ${escapeHtml(x.why || "")}</span></div>`).join("")}
+      <p class="muted">${escapeHtml(result.encouragement || "")}</p>
+      <button onclick="closeModal()">Use this plan</button>
+    `);
+  });
+}
+
+async function whatShouldIDoNext() {
+  await withAI("nextMoveBtn", async () => {
+    const openTasks = db.tasks.filter(t => (t.percent || 0) < 100).slice(0, 18).map(t => ({
+      title: t.title,
+      difficulty: t.difficulty,
+      due: t.due,
+      percent: t.percent || 0,
+      project: t.projectId ? db.projects.find(p => p.id === t.projectId)?.title || "" : "",
+      goal: t.goalId ? db.goals.find(g => g.id === t.goalId)?.title || "" : "",
+      subtasksLeft: (t.subtasks || []).filter(s => !s.done).map(s => s.title || s).slice(0, 5)
+    }));
+    const result = await callAgent("nextMove", { mood: log().mood, energy: log().energy, tasks: openTasks, routines: todaysRoutines(), theme: todayTheme() });
+    modal("🤖 What Should I Do Next?", `
+      <p>${escapeHtml(result.reason || "Here is the next best small step.")}</p>
+      <div class="item"><b>${escapeHtml(result.task || "Choose one small open task")}</b><br><span class="muted">${escapeHtml(result.timeEstimate || "10–25 minutes")}</span></div>
+      ${(result.steps || []).map(x => `<div class="item">${escapeHtml(x)}</div>`).join("")}
+      <p class="muted">${escapeHtml(result.encouragement || "Start small. Momentum counts.")}</p>
+      <button onclick="closeModal(); startPomodoro()">Start Focus Timer</button>
+      <button class="secondary" onclick="closeModal()">Close</button>
+    `);
+  });
+}
+
+async function suggestRoutine() {
+  modal("AI Routine Suggester", `
+    <label>What do you need help with?</label>
+    <textarea id="routineNeed" placeholder="Example: I need an easy morning routine before work"></textarea>
+    <button class="small secondary" onclick="voiceTo('routineNeed')">🎙 Voice</button>
+    <br><br>
+    <button id="routineSuggestBtn" onclick="runRoutineSuggester()">Suggest Routines</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+}
+async function runRoutineSuggester() {
+  await withAI("routineSuggestBtn", async () => {
+    const result = await callAgent("routineSuggester", { text: $("routineNeed").value });
+    (result.routines || []).forEach(r => db.routines.push({
+      id: uid(),
+      title: r.title || "Suggested routine",
+      time: r.time || "07:00",
+      recurrence: r.recurrence || "Daily",
+      themeDay: r.themeDay || dayNameForKey(),
+      days: r.days || [],
+      order: nextOrder("routines"),
+      subtasks: (r.subtasks || []).map(title => ({ id: uid(), title, done: false }))
+    }));
+    closeModal(); save(); toast("AI routines added.");
+  });
+}
+async function weeklyInsights() {
+  await withAI("weeklyBtn", async () => {
+    const result = await callAgent("weeklyInsights", { data: { logs: db.logs, tasks: db.tasks, routines: db.routines, projects: db.projects, goals: db.goals } });
+    modal("📊 Weekly AI Insights", `
+      <h3>Wins</h3>${(result.wins || []).map(x => `<div class="item">${escapeHtml(x)}</div>`).join("")}
+      <h3>Patterns</h3>${(result.patterns || []).map(x => `<div class="item">${escapeHtml(x)}</div>`).join("")}
+      <h3>Suggestions</h3>${(result.suggestions || []).map(x => `<div class="item">${escapeHtml(x)}</div>`).join("")}
+      <p class="muted">${escapeHtml(result.visionTieIn || "")}</p>
+      <button onclick="closeModal()">Close</button>
+    `);
+  });
+}
+function reflectionForm() {
+  modal("End-of-Day Reflection", `
+    <label>What happened today?</label>
+    <textarea id="reflectionText"></textarea>
+    <button class="small secondary" onclick="voiceTo('reflectionText')">🎙 Voice</button>
+    <br><br>
+    <button id="reflectBtn" onclick="runReflection()">Reflect with AI</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+}
+async function runReflection() {
+  await withAI("reflectBtn", async () => {
+    const text = $("reflectionText").value;
+    const result = await callAgent("reflection", { text });
+    log().reflections.push({ date: todayKey(), text, result });
+    save();
+    modal("🌙 Reflection Coach", `
+      <p><b>Affirmation:</b> ${escapeHtml(result.affirmation || "")}</p>
+      <p><b>Pattern:</b> ${escapeHtml(result.pattern || "")}</p>
+      <p><b>Tomorrow:</b> ${escapeHtml(result.tomorrow || "")}</p>
+      <button onclick="closeModal()">Close</button>
+    `);
+  });
+}
+
+
+function normalizeSubtasks(task) {
+  if (!task.subtasks) task.subtasks = [];
+  task.subtasks = task.subtasks.map(s => {
+    if (typeof s === "string") return { id: uid(), title: s, done: false };
+    return { id: s.id || uid(), title: s.title || String(s), done: Boolean(s.done) };
+  });
+}
+
+function updateTaskProgressFromSubtasks(taskId, awardPoints = false) {
+  const task = db.tasks.find(t => t.id === taskId);
+  if (!task) return;
+  normalizeSubtasks(task);
+  if (!task.subtasks.length) return;
+  const previous = task.percent || 0;
+  const completed = task.subtasks.filter(s => s.done).length;
+  task.percent = Math.round((completed / task.subtasks.length) * 100);
+
+  if (awardPoints && task.percent > previous) {
+    const pointGain = Math.max(1, Math.round(pointsFor(task.difficulty) * ((task.percent - previous) / 100)));
+    log().points += pointGain;
+    if (task.percent >= 100 && !log().completedTasks.includes(task.id)) {
+      log().completedTasks.push(task.id);
+    }
+  }
+}
+
+function toggleSubtask(taskId, subtaskIndex) {
+  const task = db.tasks.find(t => t.id === taskId);
+  if (!task) return;
+  normalizeSubtasks(task);
+  const subtask = task.subtasks[subtaskIndex];
+  if (!subtask) return;
+  subtask.done = !subtask.done;
+  updateTaskProgressFromSubtasks(taskId, true);
+  save();
+}
+
+function subtaskChecklistHtml(task) {
+  normalizeSubtasks(task);
+  if (!task.subtasks.length) return `<div class="muted">No subtasks yet.</div>`;
+  return `<div style="margin-top:8px">${task.subtasks.map((s, idx) => `
+    <label class="checkline">
+      <input type="checkbox" ${s.done ? "checked" : ""} onchange="toggleSubtask('${task.id}', ${idx})">
+      <span style="${s.done ? "text-decoration:line-through;opacity:.7" : ""}">${escapeHtml(s.title || s)}</span>
+    </label>
+  `).join("")}</div>`;
+}
+
+function itemTask(t) {
+  normalizeSubtasks(t);
+  const collapsed = isCollapsed("task", t.id);
+  const subCount = (t.subtasks || []).length;
+  const doneSubCount = (t.subtasks || []).filter(s => s.done).length;
+  const linkedProject = t.projectId ? db.projects.find(p => p.id === t.projectId)?.title : "";
+  const linkedGoal = t.goalId ? db.goals.find(g => g.id === t.goalId)?.title : "";
+  return `<div class="item ${(t.percent || 0) >= 100 ? "done" : ""}">
+    <div class="between">
+      <div style="flex:1">
+        <div class="title" onclick="toggleCollapse('task','${t.id}')" style="cursor:pointer">${caret("task", t.id)} ${escapeHtml(t.title)}</div>
+        <div class="muted">${t.difficulty || "Easy"} · ${pointsFor(t.difficulty)} pts · ${t.percent || 0}%${subCount ? ` · ${doneSubCount}/${subCount} subtasks` : ""}${t.due ? " · due " + t.due.replace("T", " ") : ""}</div>
+        ${(linkedProject || linkedGoal) ? `<div class="muted">${linkedProject ? "Project: " + escapeHtml(linkedProject) : ""}${linkedProject && linkedGoal ? " · " : ""}${linkedGoal ? "Goal: " + escapeHtml(linkedGoal) : ""}</div>` : ""}
+      </div>
+      <div class="orderControls"><button class="small" onclick="completeTask('${t.id}',100)">✓</button>${orderButtons('tasks', t.id)}</div>
+    </div>
+    <div class="progress"><div class="bar" style="width:${t.percent || 0}%"></div></div>
+    ${collapsed ? "" : `
+      ${t.notes ? `<p class="muted">${escapeHtml(t.notes)}</p>` : ""}
+      ${subtaskChecklistHtml(t)}
+      <div class="row" style="margin-top:8px">
+        <button class="small secondary" onclick="completeTask('${t.id}',50)">Partial</button>
+        <button class="small secondary" onclick="editSubtasksQuick('task','${t.id}')">Edit Subtasks</button><button class="small secondary" onclick="formTask(db.tasks.find(t=>t.id==='${t.id}'))">Edit Full Task</button>
+        <button class="small danger" onclick="remove('tasks','${t.id}')">Delete</button>
+      </div>
+    `}
+  </div>`;
+}
+function routineItem(r) {
+  const done = log().completedRoutines.includes(r.id);
+  const collapsed = isCollapsed("routine", r.id);
+  const subCount = (r.subtasks || []).length;
+  const stepDoneCount = (r.subtasks || []).filter(s => isRoutineStepDone(r.id, s.id || s.title)).length;
+  const theme = r.themeDay ? ` · ${r.themeDay} Theme` : "";
+  return `<div class="item ${done ? "done" : ""}">
+    <div class="between">
+      <div style="flex:1">
+        <div class="title" onclick="toggleCollapse('routine','${r.id}')" style="cursor:pointer">${caret("routine", r.id)} ${escapeHtml(r.title)}</div>
+        <div class="muted">${r.time || ""} · ${escapeHtml(routineScheduleLabel(r))}${theme}${subCount ? ` · ${stepDoneCount}/${subCount} steps today` : ""}</div>
+      </div>
+      <div class="orderControls"><button class="small" onclick="completeRoutine('${r.id}')">✓</button>${orderButtons('routines', r.id)}</div>
+    </div>
+    ${collapsed ? "" : `
+      ${(r.subtasks || []).length ? `<div>${r.subtasks.map(s => `<label class="checkline"><input type="checkbox" ${isRoutineStepDone(r.id, s.id || s.title) ? "checked" : ""} onchange="toggleRoutineStep('${r.id}','${s.id || s.title}')"><span>${escapeHtml(s.title || s)}</span></label>`).join("")}</div>` : ""}
+      <div class="row" style="margin-top:8px">
+        <button class="small secondary" onclick="editSubtasksQuick('routine','${r.id}')">Edit Steps</button><button class="small secondary" onclick="formRoutine(db.routines.find(r=>r.id==='${r.id}'))">Edit Routine</button>
+        <button class="small danger" onclick="remove('routines','${r.id}')">Delete</button>
+      </div>
+    `}
+  </div>`;
+}
+
+function metric(name, pct) {
+  return `<div class="metric"><span>${name}</span><strong>${pct}%</strong><div class="progress"><div class="bar" style="width:${pct}%"></div></div></div>`;
+}
+
+
+function parseDueDateValue(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function topTasksForToday() {
+  const open = db.tasks.filter(t => (t.percent || 0) < 100);
+  const scoreTask = (t) => {
+    const due = parseDueDateValue(t.due);
+    const dueScore = due ? Math.max(0, 10000000000000 - Math.abs(due - new Date())) : 0;
+    const difficultyScore = t.difficulty === "Hard" ? 30 : t.difficulty === "Medium" ? 20 : 10;
+    const projectBoost = t.projectId || t.goalId ? 8 : 0;
+    return dueScore + difficultyScore + projectBoost;
+  };
+  return open.sort((a, b) => scoreTask(b) - scoreTask(a)).slice(0, 3);
+}
+
+function nextActionTasks() {
+  return db.tasks
+    .filter(t => (t.percent || 0) < 100)
+    .sort((a, b) => {
+      const ad = parseDueDateValue(a.due);
+      const bd = parseDueDateValue(b.due);
+      if (ad && bd) return ad - bd;
+      if (ad) return -1;
+      if (bd) return 1;
+      return pointsFor(b.difficulty) - pointsFor(a.difficulty);
+    })
+    .slice(0, 5);
+}
+
+function activeProjectsList() {
+  return db.projects
+    .map(p => ({ ...p, progress: projectProgress(p), openCount: db.tasks.filter(t => t.projectId === p.id && (t.percent || 0) < 100).length }))
+    .filter(p => p.progress < 100 || p.openCount > 0)
+    .sort((a, b) => b.openCount - a.openCount)
+    .slice(0, 4);
+}
+
+function weekStartDate() {
+  const d = new Date();
+  const day = d.getDay();
+  const diff = d.getDate() - day;
+  d.setDate(diff);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function dateKeyFromDate(d) {
+  const copy = new Date(d);
+  copy.setMinutes(copy.getMinutes() - copy.getTimezoneOffset());
+  return copy.toISOString().slice(0, 10);
+}
+
+function weeklyStats() {
+  const start = weekStartDate();
+  let points = 0;
+  let activeDays = 0;
+  let completedTasks = 0;
+  let completedRoutines = 0;
+  const days = [];
+
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(start);
+    d.setDate(start.getDate() + i);
+    const key = dateKeyFromDate(d);
+    const dayLog = db.logs[key] || { points: 0, completedTasks: [], completedRoutines: [] };
+    const dayPoints = dayLog.points || 0;
+    points += dayPoints;
+    completedTasks += (dayLog.completedTasks || []).length;
+    completedRoutines += (dayLog.completedRoutines || []).length;
+    if (dayPoints > 0) activeDays += 1;
+    days.push({ key, points: dayPoints });
+  }
+
+  return { points, activeDays, completedTasks, completedRoutines, days };
+}
+
+function calculateStreak() {
+  let streak = 0;
+  const d = new Date();
+  for (let i = 0; i < 365; i++) {
+    const key = dateKeyFromDate(d);
+    const dayLog = db.logs[key];
+    if (dayLog && (dayLog.points || 0) > 0) {
+      streak += 1;
+      d.setDate(d.getDate() - 1);
+    } else {
+      break;
+    }
+  }
+  return streak;
+}
+
+function miniTaskCard(t) {
+  normalizeSubtasks(t);
+  const subCount = (t.subtasks || []).length;
+  const doneSubCount = (t.subtasks || []).filter(s => s.done).length;
+  return `<div class="item">
+    <div class="between">
+      <div>
+        <div class="title">${escapeHtml(t.title)}</div>
+        <div class="muted">${t.difficulty || "Easy"} · ${pointsFor(t.difficulty)} pts${subCount ? ` · ${doneSubCount}/${subCount} subtasks` : ""}${t.due ? " · " + escapeHtml(t.due.replace("T", " ")) : ""}</div>
+      </div>
+      <button class="small" onclick="completeTask('${t.id}',100)">✓</button>
+    </div>
+  </div>`;
+}
+
+function dashboardWidgetHtml(widget, data) {
+  const { l, routinePct, taskPct, projectPct, goalPct, top3, nextActions, activeProjects, week, streak, weeklyGoal, weeklyPct } = data;
+  const widgetMap = {
+    quest: `
+      <div class="card">
+        <div class="between" style="margin-bottom:10px"><div>${userStatusHtml()}</div><button class="secondary small" onclick="saveToCloudNow().then(()=>toast('Cloud sync saved.')).catch(e=>toast('Cloud sync failed.'))">Sync Now</button></div>
+        <div class="between">
+          <div><b>Quest Points</b><strong style="font-size:2rem;display:block">${l.points}</strong><span class="muted">Today goal: ${db.settings.dailyGoal} · Lifetime: ${totalPoints()} · AI uses today: ${l.aiUses || 0}/12</span></div>
+          <div class="row"><button id="planBtn" onclick="planDay()">Plan My Day</button><button id="nextMoveBtn" class="secondary" onclick="whatShouldIDoNext()">What Next?</button></div>
+        </div>
+        <div class="progress"><div class="bar" style="width:${Math.min(100, Math.round(l.points / db.settings.dailyGoal * 100))}%"></div></div>
+        <p class="muted">🌟 ${escapeHtml(db.settings.vision)}</p>
+      </div>`,
+    todayTheme: `
+      <div class="card">
+        <div class="between"><div><b>🌿 ${escapeHtml(todayTheme().day)} Theme: ${escapeHtml(todayTheme().title)}</b><div class="muted">${escapeHtml(todayTheme().focus)}</div></div><button class="secondary small" onclick="editThemedDays()">Edit Themes</button></div>
+      </div>`,
+    metrics: `
+      <div class="grid">
+        <div class="metric"><span>🔥 Streak</span><strong>${streak}</strong><span class="muted">Active days in a row</span></div>
+        <div class="metric"><span>🏆 Weekly Progress</span><strong>${weeklyPct}%</strong><div class="progress"><div class="bar" style="width:${weeklyPct}%"></div></div><span class="muted">${week.points}/${weeklyGoal} pts · ${week.activeDays}/7 active days</span></div>
+        ${metric("Routines", routinePct)}
+        ${metric("Tasks", taskPct)}
+        ${metric("Projects", projectPct)}
+        ${metric("Goals", goalPct)}
+      </div>`,
+    top3: `
+      <div class="card">
+        <div class="between"><b>⭐ Today's Top 3</b><span class="muted">Most important next wins</span></div>
+        ${top3.length ? top3.map(miniTaskCard).join("") : `<div class="empty">No top tasks yet. Tap + to add tasks.</div>`}
+      </div>`,
+    activeProjects: `
+      <div class="card">
+        <div class="between"><b>🚀 Active Projects</b><button class="secondary small" onclick="switchTab('projects')">View All</button></div>
+        ${activeProjects.length ? activeProjects.map(p => `<div class="item"><div class="between"><div><div class="title">${escapeHtml(p.title)}</div><div class="muted">${p.openCount} open actions</div></div><strong>${p.progress}%</strong></div><div class="progress"><div class="bar" style="width:${p.progress}%"></div></div></div>`).join("") : `<div class="empty">No active projects yet.</div>`}
+      </div>`,
+    nextActions: `
+      <div class="card">
+        <div class="between"><b>➡️ Next Actions</b><span class="muted">Small steps to keep moving</span></div>
+        ${nextActions.length ? nextActions.map(miniTaskCard).join("") : `<div class="empty">No next actions yet.</div>`}
+      </div>`,
+    weeklyProgress: `
+      <div class="card">
+        <div class="between"><b>📊 Weekly Progress</b><button id="weeklyBtn" class="secondary small" onclick="weeklyInsights()">AI Weekly Insights</button></div>
+        <div class="progress"><div class="bar" style="width:${weeklyPct}%"></div></div>
+        <p class="muted">${week.points} points this week · ${week.completedTasks} tasks completed · ${week.completedRoutines} routines completed</p>
+        <div class="grid">
+          ${week.days.map(d => `<div class="metric"><span>${d.key.slice(5)}</span><strong>${d.points}</strong><span class="muted">pts</span></div>`).join("")}
+        </div>
+      </div>`,
+    pomodoro: `
+      <div class="card">
+        <div class="between"><b>Pomodoro Focus</b><strong>${pomodoroLabel()}</strong></div>
+        <div class="row"><button onclick="startPomodoro()">Start</button><button class="secondary" onclick="resetPomodoro()">Reset</button></div>
+      </div>`,
+    moodEnergy: `
+      <div class="card">
+        <div class="between"><b>Mood & Energy</b><button class="secondary small" onclick="reflectionForm()">Reflect</button></div>
+        <label>Mood: ${l.mood}</label><input type="range" min="1" max="5" value="${l.mood}" oninput="log().mood=Number(this.value); save()">
+        <label>Energy: ${l.energy}</label><input type="range" min="1" max="5" value="${l.energy}" oninput="log().energy=Number(this.value); save()">
+      </div>`,
+    todayRoutines: `<div class="card"><div class="between"><b>Today's Routines</b><span class="muted">Only routines scheduled for today</span></div>${todaysRoutines().map(routineItem).join("") || `<div class="empty">No routines scheduled for today.</div>`}</div>`
+  };
+  return widgetMap[widget] || "";
+}
+
+function renderToday() {
+  ensureAppState();
+  const l = log();
+  const taskPct = percent(db.tasks, t => (t.percent || 0) >= 100);
+  const todays = todaysRoutines();
+  const routinePct = percent(todays, r => l.completedRoutines.includes(r.id));
+  const projectPct = db.projects.length ? Math.round(db.projects.reduce((s, p) => s + projectProgress(p), 0) / db.projects.length) : 0;
+  const goalPct = db.goals.length ? Math.round(db.goals.reduce((s, g) => s + goalProgress(g), 0) / db.goals.length) : 0;
+  const data = {
+    l,
+    routinePct,
+    taskPct,
+    projectPct,
+    goalPct,
+    top3: topTasksForToday(),
+    nextActions: nextActionTasks(),
+    activeProjects: activeProjectsList(),
+    week: weeklyStats(),
+    streak: calculateStreak()
+  };
+  data.weeklyGoal = Math.max(1, db.settings.dailyGoal * 7);
+  data.weeklyPct = Math.min(100, Math.round(data.week.points / data.weeklyGoal * 100));
+  $("today").innerHTML = db.settings.dashboardOrder.map(widget => dashboardWidgetHtml(widget, data)).join("");
+}
+
+function listSortControls(type) {
+  const mode = db.settings.listSort?.[type] || "custom";
+  const secondary = type === "routines" ? "time" : type === "rewards" ? "threshold" : "default";
+  const secondaryLabel = type === "routines" ? "Time" : type === "rewards" ? "Points" : "Default";
+  return `<div class="listTools"><span class="dragHint">Order:</span><select onchange="setListSort('${type}', this.value)"><option value="custom" ${mode === "custom" ? "selected" : ""}>Custom</option><option value="${secondary}" ${mode === secondary ? "selected" : ""}>${secondaryLabel}</option></select></div>`;
+}
+
+function renderCustomize() {
+  ensureAppState();
+  const pageRows = db.settings.pageOrder.map(tab => `<div class="item between"><div><b>${PAGE_LABELS[tab]}</b><div class="muted">Bottom app tab</div></div><div class="orderControls"><button class="small secondary" onclick="moveInOrderArray('page','${tab}',-1)">↑</button><button class="small secondary" onclick="moveInOrderArray('page','${tab}',1)">↓</button></div></div>`).join("");
+  const widgetRows = db.settings.dashboardOrder.map(w => `<div class="item between"><div><b>${DASHBOARD_LABELS[w]}</b><div class="muted">Dashboard section</div></div><div class="orderControls"><button class="small secondary" onclick="moveInOrderArray('dashboard','${w}',-1)">↑</button><button class="small secondary" onclick="moveInOrderArray('dashboard','${w}',1)">↓</button></div></div>`).join("");
+  $("customize").innerHTML = `
+    <div class="card">
+      <div class="between"><div><b>Customize App Layout</b><div class="muted">Keep the app-style pages, but put the things you use most first.</div></div><button class="secondary small" onclick="resetOrder('page'); resetOrder('dashboard')">Reset All</button></div>
+    </div>
+    <div class="card"><div class="between"><b>Bottom Page Order</b><button class="secondary small" onclick="resetOrder('page')">Reset Pages</button></div>${pageRows}</div>
+    <div class="card"><div class="between"><b>Dashboard Widget Order</b><button class="secondary small" onclick="resetOrder('dashboard')">Reset Dashboard</button></div>${widgetRows}</div>
+    <div class="card"><div class="between"><div><b>Themed Days</b><p class="muted">Grace & Order style repeatable focus areas that take the thinking out of recurring work.</p></div><button class="secondary small" onclick="editThemedDays()">Edit Themes</button></div>${DAYS.map(day => `<div class="item"><b>${day}: ${escapeHtml((db.settings.themedDays?.[day] || DEFAULT_THEMED_DAYS[day]).title)}</b><div class="muted">${escapeHtml((db.settings.themedDays?.[day] || DEFAULT_THEMED_DAYS[day]).focus)}</div></div>`).join("")}</div>
+    <div class="card"><b>List Page Sorting</b><p class="muted">Choose Custom on a list page, then use ↑ and ↓ beside each item to arrange it manually.</p>
+      <div class="item between"><b>Tasks</b>${listSortControls('tasks')}</div>
+      <div class="item between"><b>Routines</b>${listSortControls('routines')}</div>
+      <div class="item between"><b>Projects</b>${listSortControls('projects')}</div>
+      <div class="item between"><b>Goals</b>${listSortControls('goals')}</div>
+      <div class="item between"><b>Rewards</b>${listSortControls('rewards')}</div>
+    </div>
+  `;
+}
+
+function editThemedDays() {
+  ensureAppState();
+  const rows = DAYS.map(day => {
+    const theme = db.settings.themedDays[day] || DEFAULT_THEMED_DAYS[day];
+    return `<div class="item"><b>${day}</b><label>Theme title</label><input id="themeTitle_${day}" value="${escapeHtml(theme.title)}"><label>Focus / notes</label><textarea id="themeFocus_${day}">${escapeHtml(theme.focus)}</textarea></div>`;
+  }).join("");
+  modal("Edit Themed Days", `
+    <p class="muted">Use these as your weekly Grace & Order rhythm. Routines can be assigned to a themed day and will automatically show when that day arrives.</p>
+    ${rows}
+    <button onclick="saveThemedDays()">Save Themes</button>
+    <button class="secondary" onclick="resetThemedDays()">Reset Defaults</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  `);
+}
+function saveThemedDays() {
+  db.settings.themedDays = db.settings.themedDays || {};
+  DAYS.forEach(day => {
+    db.settings.themedDays[day] = {
+      title: $(`themeTitle_${day}`).value.trim() || DEFAULT_THEMED_DAYS[day].title,
+      focus: $(`themeFocus_${day}`).value.trim() || DEFAULT_THEMED_DAYS[day].focus
+    };
+  });
+  closeModal(); save();
+}
+function resetThemedDays() {
+  db.settings.themedDays = JSON.parse(JSON.stringify(DEFAULT_THEMED_DAYS));
+  closeModal(); save();
+}
+
+function renderTasks() {
+  const items = orderedItems("tasks");
+  $("tasks").innerHTML = `<div class="card between"><b>Tasks</b><div class="row">${listSortControls('tasks')}<button class="secondary small" onclick="expandAll('task')">Expand All</button><button class="secondary small" onclick="collapseAll('task')">Collapse All</button><button onclick="formTask()">Add Task</button></div></div>${items.map(itemTask).join("") || `<div class="card empty">No tasks yet.</div>`}`;
+}
+function renderRoutines() {
+  const items = orderedItems("routines", (a,b)=>(a.time||"").localeCompare(b.time||""));
+  const dueToday = items.filter(r => routineOccursOn(r));
+  const other = items.filter(r => !routineOccursOn(r));
+  const th = todayTheme();
+  $("routines").innerHTML = `
+    <div class="card">
+      <div class="between"><div><b>🌿 ${escapeHtml(th.day)} Theme: ${escapeHtml(th.title)}</b><div class="muted">${escapeHtml(th.focus)}</div></div><button class="secondary small" onclick="editThemedDays()">Edit Themes</button></div>
+    </div>
+    <div class="card between"><b>Routines</b><div class="row">${listSortControls('routines')}<button class="secondary small" onclick="expandAll('routine')">Expand All</button><button class="secondary small" onclick="collapseAll('routine')">Collapse All</button><button onclick="formRoutine()">Add</button><button class="secondary" onclick="suggestRoutine()">AI Suggest</button></div></div>
+    <div class="card"><b>Due Today</b>${dueToday.map(routineItem).join("") || `<div class="empty">No routines scheduled for today.</div>`}</div>
+    <div class="card"><b>All Other Recurring Routines</b>${other.map(routineItem).join("") || `<div class="empty">No other routines yet.</div>`}</div>`;
+}
+function renderProjects() {
+  const items = orderedItems("projects");
+  $("projects").innerHTML = `<div class="card between"><b>Projects</b><div class="row">${listSortControls('projects')}<button class="secondary small" onclick="expandAll('project')">Expand All</button><button class="secondary small" onclick="collapseAll('project')">Collapse All</button><button onclick="formProject()">Add Project</button></div></div>` + 
+  (items.map(p => {
+    const collapsed = isCollapsed("project", p.id);
+    const linked = orderedItems("tasks").filter(t => t.projectId === p.id);
+    const openCount = linked.filter(t => (t.percent || 0) < 100).length;
+    const progress = projectProgress(p);
+    return `<div class="card">
+      <div class="between">
+        <div style="flex:1">
+          <b onclick="toggleCollapse('project','${p.id}')" style="cursor:pointer">${caret("project", p.id)} ${escapeHtml(p.title)}</b>
+          <div class="muted">${linked.length} tasks · ${openCount} open · ${progress}% complete</div>
+        </div>
+        <div class="orderControls"><span>${progress}%</span>${orderButtons('projects', p.id)}</div>
+      </div>
+      <div class="progress"><div class="bar" style="width:${progress}%"></div></div>
+      ${collapsed ? "" : `
+        <p class="muted">${escapeHtml(p.vision || "No project vision yet.")}</p>
+        ${linked.map(itemTask).join("")}
+        <br><button class="small secondary" onclick="formProject(db.projects.find(p=>p.id==='${p.id}'))">Edit</button>
+        <button class="small danger" onclick="remove('projects','${p.id}')">Delete</button>
+      `}
+    </div>`;
+  }).join("") || `<div class="card empty">No projects yet.</div>`);
+}
+function renderGoals() {
+  const items = orderedItems("goals");
+  $("goals").innerHTML = `<div class="card between"><b>Goals</b><div class="row">${listSortControls('goals')}<button class="secondary small" onclick="expandAll('goal')">Expand All</button><button class="secondary small" onclick="collapseAll('goal')">Collapse All</button><button onclick="formGoal()">Add Goal</button></div></div>` + 
+  (items.map(g => {
+    const collapsed = isCollapsed("goal", g.id);
+    const linked = orderedItems("tasks").filter(t => t.goalId === g.id);
+    const openCount = linked.filter(t => (t.percent || 0) < 100).length;
+    const progress = goalProgress(g);
+    return `<div class="card">
+      <div class="between">
+        <div style="flex:1">
+          <b onclick="toggleCollapse('goal','${g.id}')" style="cursor:pointer">${caret("goal", g.id)} ${escapeHtml(g.title)}</b>
+          <div class="muted">${linked.length} tasks · ${openCount} open · ${progress}% complete</div>
+        </div>
+        <div class="orderControls"><span>${progress}%</span>${orderButtons('goals', g.id)}</div>
+      </div>
+      <div class="progress"><div class="bar" style="width:${progress}%"></div></div>
+      ${collapsed ? "" : `
+        <p class="muted">${escapeHtml(g.vision || "No goal vision yet.")}</p>
+        ${linked.map(itemTask).join("")}
+        <br><button class="small secondary" onclick="formGoal(db.goals.find(g=>g.id==='${g.id}'))">Edit</button>
+        <button class="small danger" onclick="remove('goals','${g.id}')">Delete</button>
+      `}
+    </div>`;
+  }).join("") || `<div class="card empty">No goals yet.</div>`);
+}
+function renderRewards() {
+  const total = totalPoints();
+  const sorter = (a,b)=>a.threshold-b.threshold;
+  const items = orderedItems("rewards", sorter);
+  $("rewards").innerHTML = `<div class="card between"><div><b>Reward Vault</b><div class="muted">Lifetime points: ${total}</div></div><div class="row">${listSortControls('rewards')}<button onclick="formReward()">Add Reward</button></div></div>` + 
+  items.map(r => {
+    const unlocked = total >= r.threshold;
+    const pct = Math.min(100, Math.round(total / r.threshold * 100));
+    return `<div class="card"><div class="between"><b>${unlocked ? "🔓" : "🔒"} ${escapeHtml(r.title)}</b><div class="orderControls"><span class="gold">${r.threshold} pts</span>${orderButtons('rewards', r.id)}</div></div><div class="progress"><div class="bar" style="width:${pct}%"></div></div><br><button class="small secondary" onclick="formReward(db.rewards.find(r=>r.id==='${r.id}'))">Edit</button> <button class="small danger" onclick="remove('rewards','${r.id}')">Delete</button></div>`;
+  }).join("");
+}
+function renderProgress() {
+  const days = Object.keys(db.logs).sort().slice(-14);
+  $("progress").innerHTML = `
+    <div class="card between"><div><b>Vision & Progress</b><div class="muted">Review patterns, wins, and next steps.</div></div><button id="weeklyBtn" onclick="weeklyInsights()">AI Weekly Insights</button></div>
+    <div class="grid">
+      <div class="metric"><span>Lifetime Points</span><strong>${totalPoints()}</strong></div>
+      <div class="metric"><span>Open Tasks</span><strong>${db.tasks.filter(t=>(t.percent||0)<100).length}</strong></div>
+      <div class="metric"><span>Projects</span><strong>${db.projects.length}</strong></div>
+      <div class="metric"><span>Goals</span><strong>${db.goals.length}</strong></div>
+    </div>
+    <div class="card"><b>Last 14 Days</b>${days.map(d => `<div class="item"><div class="between"><b>${d}</b><span>${db.logs[d].points || 0} pts</span></div><div class="muted">Mood ${db.logs[d].mood || 3}/5 · Energy ${db.logs[d].energy || 3}/5</div></div>`).join("") || `<div class="empty">No progress logs yet.</div>`}</div>
+  `;
+}
+function render() {
+  ensureAppState();
+  renderNav();
+  renderToday(); renderTasks(); renderRoutines(); renderProjects(); renderGoals(); renderRewards(); renderProgress(); renderCustomize();
+}
+render();
+
+initFirebaseCloudSync();
